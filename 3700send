@@ -1,0 +1,178 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import hashlib
+import json
+import select
+import socket
+import sys
+import time
+
+DATA_SIZE = 1375
+
+
+def calculate_checksum(msg):
+    """
+    Calculate the checksum for the given string.
+    :param msg: message to calculate for
+    :return: integer 8-bit checksum
+    """
+    to_send = json.dumps(msg) + '\n'
+    to_send = to_send.encode('utf-8')
+    full_checksum = hashlib.sha256(to_send).digest()
+    return sum(full_checksum) % 256
+
+
+def read_messages(k):
+    """
+    Reads in messages from the given connection.
+    Returns "" for checksum and json if either is detected as corrupted
+    :param k: conn to read from
+    :return: two parallel lists of checksums and jsons
+    """
+    messages = k.decode('utf-8').split('\n')
+    messages = [msg for msg in messages if msg != ""]
+    checksums = []
+    json_messages = []
+    for message in messages:
+        if message != "":
+            parts = message.split("{", 1)
+            try:
+                checksums.append(int(parts[0]))
+            except ValueError:
+                checksums.append("")
+                json_messages.append("")
+                continue
+            try:
+                json_messages.append(json.loads("{" + parts[1]))
+            except json.decoder.JSONDecodeError:
+                checksums.append("")
+                json_messages.append("")
+    return checksums, json_messages
+
+
+def log(message):
+    """
+    Writes message to stderr
+    :param message: message to write
+    :return:
+    """
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+
+
+class Sender:
+    """
+    Class representing a sender over a custom UDP-style protocol.
+    """
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.next_seq = 0  # last used sequence number
+        self.send_buffer = []  # messages that have been sent without ACK
+        self.time_tracker = {}  # map from seq number to when it was sent
+        self.window_size = 4  # window size
+        self.rtt = 0.5  # round trip time
+        self.done_reading = False  # done reading info from file?
+        self.waiting = False  # waiting on response ?
+
+    def send(self, message):
+        """
+        Sends message with a checksum added to it.
+        Should NOT be called from run (send_msg should be used instead).
+        :param message: message to send
+        :return:
+        """
+        to_send = json.dumps(message) + '\n'
+        to_send = to_send.encode('utf-8')
+        to_send = str(calculate_checksum(message)).encode('utf-8') + to_send
+        self.socket.sendto(to_send, (self.host, self.remote_port))
+
+    def run(self):
+        """
+        Main loop of the program
+        :return:
+        """
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+
+            # Check for incoming messages
+            socks, _, _ = select.select(sockets, [], [], 0.1)
+            for conn in socks:
+                # message from receiver
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    checksums, json_messages = read_messages(k)
+
+                    resend = False
+                    # check whether checksums are good
+                    for checksum, message in zip(checksums, json_messages):
+                        actual_checksum = calculate_checksum(message)
+                        if checksum != actual_checksum:
+                            # resend if message corrupted because
+                            resend = True
+                            break
+
+                        # passed checksum
+                        ack_s = message.get("s", None)
+                        # check if actually ack
+                        if ack_s is not None:
+                            self.send_buffer = [msg for msg in self.send_buffer if msg['s'] != ack_s]
+                            self.rtt = time.time() - self.time_tracker[ack_s]
+                            self.window_size += 1
+                        # otherwise it's an error message, must resend
+                        else:
+                            resend = True
+                    if resend:
+                        # resending
+                        for msg in self.send_buffer:
+                            self.send_msg(msg)
+                # not message from receiver, keep reading from file
+                elif conn == sys.stdin:
+                    # Check if we can send messages
+                    while len(self.send_buffer) + 1 < self.window_size:
+                        data = sys.stdin.read(DATA_SIZE)
+                        # check if out of data to send
+                        if len(data) == 0:
+                            self.done_reading = True
+                            break
+
+                        # send data and update bookkeeping
+                        msg = {"data": data, "s": self.next_seq}
+                        self.send_buffer.append(msg)
+                        self.send_msg(msg)
+                        self.next_seq += 1
+
+                # Check for timeouts
+                for msg in self.send_buffer:
+                    if abs(self.time_tracker[msg['s']] - time.time()) > 2 * self.rtt:
+                        self.send_msg(msg)
+                        if self.window_size > 1:
+                            self.window_size = self.window_size - 1
+
+                # check if fully done
+                if self.done_reading and len(self.send_buffer) == 0:
+                    sys.exit(0)
+
+        return
+
+    def send_msg(self, msg):
+        """
+        Sends the message (adds the time to time tracker).
+        Should be called from run.
+        :param msg: message to send
+        :return:
+        """
+        self.time_tracker[msg["s"]] = time.time()
+        self.send(msg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()

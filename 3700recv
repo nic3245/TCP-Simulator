@@ -1,0 +1,145 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import hashlib
+import json
+import select
+import socket
+import sys
+
+
+def calculate_checksum(msg):
+    """
+    Calculate the checksum for the given string.
+    :param msg: message to calculate for
+    :return: integer 8-bit checksum
+    """
+    to_send = json.dumps(msg) + '\n'
+    to_send = to_send.encode('utf-8')
+    full_checksum = hashlib.sha256(to_send).digest()
+    return sum(full_checksum) % 256
+
+
+def read_messages(data):
+    """
+    Reads in messages from the given connection.
+    Returns "" for checksum and json if either is detected as corrupted
+    :param data: conn to read from
+    :return: two parallel lists of checksums and jsons
+    """
+    messages = data.decode('utf-8').split('\n')
+    messages = [msg for msg in messages if msg != ""]
+    checksums = []
+    json_messages = []
+    for message in messages:
+        if message != "":
+            parts = message.split("{", 1)
+            try:
+                checksums.append(int(parts[0]))
+            except ValueError:
+                checksums.append("")
+                json_messages.append("")
+                continue
+            try:
+                json_messages.append(json.loads("{" + parts[1]))
+            except json.decoder.JSONDecodeError:
+                checksums.append("")
+                json_messages.append("")
+    return checksums, json_messages
+
+
+def log(message):
+    """
+    Writes message to stderr
+    :param message: message to write
+    :return:
+    """
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+
+
+class Receiver:
+    """
+    Class representing a receiver over a custom UDP-style protocol.
+    """
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        log("Bound to port %d" % self.port)
+
+        self.rec_msg = {}  # messages received
+        self.next_seq = 0  # next sequence number that needs to be printed
+        self.remote_host = None
+        self.remote_port = None
+
+    def send(self, message):
+        """
+        Sends message with a checksum added to it.
+        :param message: message to send
+        :return:
+        """
+        to_send = json.dumps(message) + '\n'
+        to_send = to_send.encode('utf-8')
+        to_send = str(calculate_checksum(message)).encode('utf-8') + to_send
+        self.socket.sendto(to_send, (self.remote_host, self.remote_port))
+
+    def run(self):
+        """
+        Main loop of the program
+        :return:
+        """
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't already have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                checksums, json_messages = read_messages(data)
+                # make sure checksums are good
+                for checksum, msg in zip(checksums, json_messages):
+                    actual_checksum = calculate_checksum(msg)
+                    # if they are not good, tell sender to resend
+                    if checksum != actual_checksum:
+                        msg = {}
+                        self.send(msg)
+                        break
+                    # Checksum good, so continue
+                    # Check if already received
+                    if msg["s"] not in self.rec_msg:
+                        self.rec_msg[msg["s"]] = msg
+                        # Check whether to print it
+                        if msg["s"] == self.next_seq:
+                            print(msg["data"], end='', flush=True)
+                            self.next_seq += 1
+                            self.check_for_print()
+
+                    # Send back ACK if we made it here (checksum good)
+                    msg = {"s": msg["s"]}
+                    self.send(msg)
+
+        return
+
+    def check_for_print(self):
+        """
+        Recursive function to check whether we have stored messages that need printing, and print them if we do.
+        :return:
+        """
+        next_msg = self.rec_msg.get(self.next_seq, None)
+        if next_msg is None:
+            return
+        else:
+            print(next_msg["data"], end='', flush=True)
+            self.next_seq += 1
+            self.check_for_print()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    receiver = Receiver()
+    receiver.run()
