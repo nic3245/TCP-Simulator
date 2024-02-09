@@ -9,4 +9,3 @@ $ ./3700recv <br>
 $ ./3700send <recv_host> <recv_port <br>
 $ Hello! How are you today? <br>
 $ "Hello! How are you today?" <br>
-etc.
